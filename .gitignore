@@ -1,0 +1,19 @@
+# Binaries
+/crontask
+/crontask.exe
+*.exe
+*.test
+*.out
+
+# Go
+/vendor/
+*.prof
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local config / runtime (never commit user state)
+*.log
