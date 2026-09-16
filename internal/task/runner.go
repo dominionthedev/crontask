@@ -1,7 +1,10 @@
 package task
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"time"
@@ -43,6 +46,8 @@ func Run(t *Task, record bool) (int, error) {
 		}
 	}
 
+	duration := time.Since(start).Seconds()
+
 	// Always write to log
 	f, ferr := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if ferr == nil {
@@ -62,7 +67,6 @@ func Run(t *Task, record bool) (int, error) {
 		}
 	}
 
-	duration := time.Since(start).Seconds()
 	fmt.Fprintf(os.Stderr, "← finished status=%d (%.1fs)\n", status, duration)
 
 	if record {
@@ -74,13 +78,53 @@ func Run(t *Task, record bool) (int, error) {
 		_ = store.Put(t)
 	}
 
-	// Placeholder webhooks
+	url := ""
 	if status == 0 && t.WebhookSuccess != "" {
-		fmt.Fprintf(os.Stderr, "(would POST success to %s)\n", t.WebhookSuccess)
+		url = t.WebhookSuccess
 	}
 	if status != 0 && t.WebhookFailure != "" {
-		fmt.Fprintf(os.Stderr, "(would POST failure to %s)\n", t.WebhookFailure)
+		url = t.WebhookFailure
+	}
+	if url != "" {
+		if err := postWebhook(url, t, status, duration, string(out)); err != nil {
+			fmt.Fprintf(os.Stderr, "webhook error: %v\n", err)
+		}
 	}
 
 	return status, nil
+}
+
+func postWebhook(url string, t *Task, status int, duration float64, output string) error {
+	body, _ := json.Marshal(map[string]any{
+		"task":     t.Name,
+		"status":   status,
+		"duration": duration,
+		"command":  t.Command,
+		"schedule": t.Schedule,
+		"output":   truncate(output, 4096),
+		"time":     time.Now().UTC().Format(time.RFC3339),
+	})
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "crontask/0.2")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+	}
+	return nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }

@@ -52,6 +52,7 @@ Flexible `every …` forms with a **24-hour clock**. No fixed alias list — int
 | `logs <name>` | Tail the task log |
 | `doctor` | Platform / path / backend health check |
 | `export-cron` | Dump managed crontab lines |
+| `import` | Import existing crontab entries (disabled) |
 | `version` | Print version |
 
 ## Layout
@@ -75,4 +76,4 @@ proto/                  Python prototype (reference)
 
 ## Status
 
-v0.2.0 — Cobra CLI, flexible `every…` schedules, launchd calendar mapping from structured Specs.
+v0.2.0 — Cobra CLI, flexible `every…` schedules, launchd calendar Specs, env/webhooks, crontab import.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -16,7 +17,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	root := &cobra.Command{
@@ -43,6 +44,7 @@ Schedules use a flexible "every …" syntax with 24-hour times, for example:
 		cmdRun(),
 		cmdLogs(),
 		cmdDoctor(),
+		cmdImport(),
 		cmdExportCron(),
 		cmdVersion(),
 		cmdInternalRun(),
@@ -63,6 +65,9 @@ func cmdAdd() *cobra.Command {
 		cwd         string
 		disabled    bool
 		force       bool
+		envVars     []string
+		hookOK      string
+		hookFail    string
 	)
 	c := &cobra.Command{
 		Use:   "add <name>",
@@ -75,6 +80,11 @@ func cmdAdd() *cobra.Command {
 			}
 
 			spec, err := schedule.Parse(sched)
+			if err != nil {
+				return err
+			}
+
+			env, err := parseEnvFlags(envVars)
 			if err != nil {
 				return err
 			}
@@ -93,6 +103,9 @@ func cmdAdd() *cobra.Command {
 			t.Description = desc
 			t.WorkingDir = cwd
 			t.Enabled = !disabled
+			t.Env = env
+			t.WebhookSuccess = hookOK
+			t.WebhookFailure = hookFail
 
 			b := backend.Detect(t.Backend)
 			t.Backend = b.Name()
@@ -118,6 +131,9 @@ func cmdAdd() *cobra.Command {
 	c.Flags().StringVar(&backendName, "backend", "auto", "auto | crontab | launchd")
 	c.Flags().StringVarP(&desc, "description", "d", "", "optional description")
 	c.Flags().StringVar(&cwd, "cwd", "", "working directory")
+	c.Flags().StringArrayVar(&envVars, "env", nil, "environment variable KEY=VALUE (repeatable)")
+	c.Flags().StringVar(&hookOK, "webhook-success", "", "POST JSON here when the task succeeds")
+	c.Flags().StringVar(&hookFail, "webhook-failure", "", "POST JSON here when the task fails")
 	c.Flags().BoolVar(&disabled, "disabled", false, "create but do not install yet")
 	c.Flags().BoolVarP(&force, "force", "f", false, "overwrite existing task")
 	_ = c.MarkFlagRequired("cmd")
@@ -407,6 +423,119 @@ func avail(ok bool) string {
 		return "available"
 	}
 	return "missing"
+}
+
+
+func parseEnvFlags(pairs []string) (map[string]string, error) {
+	env := map[string]string{}
+	for _, p := range pairs {
+		k, v, ok := strings.Cut(p, "=")
+		if !ok || k == "" {
+			return nil, fmt.Errorf("invalid --env %q (want KEY=VALUE)", p)
+		}
+		env[k] = v
+	}
+	return env, nil
+}
+
+func cmdImport() *cobra.Command {
+	var dryRun bool
+	var prefix string
+	c := &cobra.Command{
+		Use:   "import",
+		Short: "Import entries from the user crontab into crontask",
+		Long: `Read the current user crontab and create disabled crontask entries
+for lines that are not already managed by crontask.
+
+Each imported job is stored with its original 5-field cron expression
+and marked disabled so nothing is double-scheduled until you enable it.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			out, err := exec.Command("crontab", "-l").Output()
+			if err != nil {
+				fmt.Println("no crontab to import (empty or missing)")
+				return nil
+			}
+
+			store := task.NewStore()
+			existing, err := store.Load()
+			if err != nil {
+				return err
+			}
+
+			imported := 0
+			skipped := 0
+			for _, line := range strings.Split(string(out), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				if strings.Contains(line, "# crontask:") {
+					skipped++
+					continue
+				}
+				fields := strings.Fields(line)
+				if len(fields) < 6 {
+					continue
+				}
+				cronExpr := strings.Join(fields[:5], " ")
+				command := strings.Join(fields[5:], " ")
+				// strip trailing inline comments that aren't our marker
+				if i := strings.Index(command, " #"); i >= 0 {
+					command = strings.TrimSpace(command[:i])
+				}
+
+				name := prefix + slugFromCommand(command, imported+1)
+				if _, exists := existing[name]; exists {
+					name = fmt.Sprintf("%s-%d", name, imported+1)
+				}
+
+				if dryRun {
+					fmt.Printf("would import %q schedule=%q cmd=%q\n", name, cronExpr, command)
+					imported++
+					continue
+				}
+
+				t := task.New(name, command, cronExpr)
+				t.Enabled = false
+				t.Backend = "crontab"
+				t.Description = "imported from crontab"
+				if err := store.Put(t); err != nil {
+					return err
+				}
+				existing[name] = t
+				fmt.Printf("imported %q (disabled) schedule=%q\n", name, cronExpr)
+				imported++
+			}
+			fmt.Printf("done: %d imported, %d already managed\n", imported, skipped)
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&dryRun, "dry-run", false, "print what would be imported without writing")
+	c.Flags().StringVar(&prefix, "prefix", "imported-", "name prefix for imported tasks")
+	return c
+}
+
+func slugFromCommand(cmd string, n int) string {
+	// crude slug from first token of the command
+	tok := strings.Fields(cmd)
+	base := "job"
+	if len(tok) > 0 {
+		base = filepath.Base(tok[0])
+		base = strings.TrimSuffix(base, filepath.Ext(base))
+	}
+	base = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		default:
+			return '-'
+		}
+	}, base)
+	base = strings.Trim(base, "-")
+	if base == "" {
+		base = "job"
+	}
+	return fmt.Sprintf("%s%d", base, n)
 }
 
 func cmdExportCron() *cobra.Command {
