@@ -9,7 +9,7 @@ crontask doctor
 
 crontask add backup \
   --cmd 'rsync -a ~/Documents /Volumes/Backup' \
-  --schedule 'daily at 02:00'
+  --schedule 'every day at 02:00'
 
 crontask add ping \
   --cmd 'curl -fsS https://hc-ping.com/your-uuid' \
@@ -25,49 +25,54 @@ crontask rm backup
 
 ## Schedule syntax
 
-| Input                    | Cron expression |
-| ------------------------ | --------------- |
-| `every 5m` / `every 15m` | `*/5 * * * *`   |
-| `every 2h`               | `0 */2 * * *`   |
-| `hourly`                 | `0 * * * *`     |
-| `daily` / `midnight`     | `0 0 * * *`     |
-| `daily at 09:30`         | `30 9 * * *`    |
-| `weekdays at 08:00`      | `0 8 * * 1-5`   |
-| `@reboot` `@daily` …     | kept as-is      |
-| classic 5-field cron     | passed through  |
+Flexible `every …` forms with a **24-hour clock**. No fixed alias list — intervals and times are parsed and translated internally.
+
+| Input | Meaning | Cron (crontab) | launchd |
+| ----- | ------- | -------------- | ------- |
+| `every 5m` / `every 15min` | every N minutes | `*/N * * * *` | `StartInterval` N×60s |
+| `every 2h` / `every 2 hours` | every N hours | `0 */N * * *` | `StartInterval` N×3600s |
+| `every 1d` / `every 3 days` | every N days at midnight | `0 0 */N * *` | `StartInterval` N×86400s |
+| `every day at 14:30` | daily at 14:30 | `30 14 * * *` | `StartCalendarInterval` Hour/Minute |
+| `at 14:30` | same as every day at … | `30 14 * * *` | calendar |
+| `every weekday at 09:00` | Mon–Fri | `0 9 * * 1-5` | five calendar entries |
+| `every monday at 08:15` | specific weekday | `15 8 * * 1` | calendar + Weekday |
+| `@reboot` `@hourly` `@daily` `@weekly` `@monthly` | specials | as-is | interval / calendar / RunAtLoad |
+| classic 5-field cron | passed through | as-is | best-effort mapping |
 
 ## Commands
 
-| Command              | Purpose                                |
-| -------------------- | -------------------------------------- |
-| `add`                | Create + install a task                |
-| `list`               | Show all known tasks + live status     |
-| `show <name>`        | Full JSON details                      |
-| `rm <name>`          | Uninstall + delete                     |
-| `enable` / `disable` | Toggle without losing the definition   |
-| `run <name>`         | Execute immediately (records last_run) |
-| `logs <name>`        | Tail the task log                      |
-| `doctor`             | Platform / path / backend health check |
-| `export-cron`        | Dump managed crontab lines             |
+| Command | Purpose |
+| ------- | ------- |
+| `add` | Create + install a task |
+| `list` | Show all known tasks + live status |
+| `show <name>` | Full JSON details |
+| `rm <name>` | Uninstall + delete |
+| `enable` / `disable` | Toggle without losing the definition |
+| `run <name>` | Execute immediately (records last_run) |
+| `logs <name>` | Tail the task log |
+| `doctor` | Platform / path / backend health check |
+| `export-cron` | Dump managed crontab lines |
+| `version` | Print version |
 
 ## Layout
 
 ```
-cmd/crontask/          CLI entrypoint
+main.go                 Cobra CLI entrypoint
 internal/
-  task/                Task model, store, runner
-  schedule/            Human → cron parser
-  backend/             crontab + launchd adapters
-  config/              Paths (XDG / Application Support)
+  task/                 Task model, store, runner
+  schedule/             every… parser → cron + launchd Spec
+  backend/              crontab + launchd adapters
+  config/               Paths (XDG / Application Support)
+proto/                  Python prototype (reference)
 ```
 
 ## How it works
 
 - Definitions live in `~/.config/crontask/tasks.json` (macOS: `~/Library/Application Support/crontask/`).
 - Linux: manages user crontab, each line tagged `# crontask: <name>`.
-- macOS: writes a LaunchAgent plist and uses `launchctl bootstrap` / `bootout`.
+- macOS: writes a LaunchAgent plist from a structured `schedule.Spec` (`StartInterval` or one/many `StartCalendarInterval` dicts) and uses `launchctl bootstrap` / `bootout`.
 - Jobs always execute through `crontask _run <name>` so last_run / last_status are recorded and logs are centralised.
 
 ## Status
 
-v0.1.0 — core CLI + crontab backend working. launchd plist generation present; full calendar mapping still minimal.
+v0.2.0 — Cobra CLI, flexible `every…` schedules, launchd calendar mapping from structured Specs.
