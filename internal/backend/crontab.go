@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/dominionthedev/crontask/internal/config"
+	"github.com/dominionthedev/crontask/internal/schedule"
 	"github.com/dominionthedev/crontask/internal/task"
 )
 
@@ -15,7 +16,7 @@ type Crontab struct{}
 
 func (c *Crontab) Name() string { return "crontab" }
 
-func (c *Crontab) Install(t *task.Task, cronExpr string) error {
+func (c *Crontab) Install(t *task.Task, spec *schedule.Spec) error {
 	if err := mustLookPath("crontab"); err != nil {
 		return err
 	}
@@ -53,7 +54,7 @@ func (c *Crontab) Install(t *task.Task, cronExpr string) error {
 
 	// crontab calls back into us so we can record last_run etc.
 	runner := fmt.Sprintf("%s _run %s", quote(self), quote(t.Name))
-	entry := fmt.Sprintf("%s %s%s  %s", cronExpr, runner, logRedirect, marker)
+	entry := fmt.Sprintf("%s %s%s  %s", spec.Cron, runner, logRedirect, marker)
 
 	filtered = append(filtered, entry)
 	return c.set(filtered)

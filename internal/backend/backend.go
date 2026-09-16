@@ -7,13 +7,14 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/dominionthedev/crontask/internal/schedule"
 	"github.com/dominionthedev/crontask/internal/task"
 )
 
 // Backend installs/uninstalls a task into the system scheduler.
 type Backend interface {
 	Name() string
-	Install(t *task.Task, cronExpr string) error
+	Install(t *task.Task, spec *schedule.Spec) error
 	Uninstall(t *task.Task) error
 	IsLive(t *task.Task) bool
 }
@@ -47,27 +48,20 @@ func Available() (crontab, launchd bool) {
 }
 
 // SelfBinary returns the absolute path of the current executable.
-// Used so crontab/launchd can call back into us for _run.
 func SelfBinary() (string, error) {
 	return os.Executable()
 }
 
 func quote(s string) string {
-	// minimal shell quoting
 	if strings.ContainsAny(s, " \t\n\"'\\$`") {
 		return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 	}
 	return s
 }
 
-// Ensure the marker line is easy to find.
 func markerLine(t *task.Task) string {
 	return t.CrontabMarker
 }
-
-// ---------------------------------------------------------------------------
-// Helpers shared by implementations
-// ---------------------------------------------------------------------------
 
 func run(name string, args ...string) error {
 	cmd := exec.Command(name, args...)

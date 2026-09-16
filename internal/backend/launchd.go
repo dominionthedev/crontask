@@ -6,10 +6,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 
 	"github.com/dominionthedev/crontask/internal/config"
+	"github.com/dominionthedev/crontask/internal/schedule"
 	"github.com/dominionthedev/crontask/internal/task"
 )
 
@@ -18,7 +18,7 @@ type Launchd struct{}
 
 func (l *Launchd) Name() string { return "launchd" }
 
-func (l *Launchd) Install(t *task.Task, cronExpr string) error {
+func (l *Launchd) Install(t *task.Task, spec *schedule.Spec) error {
 	if runtime.GOOS != "darwin" {
 		return fmt.Errorf("launchd is only available on macOS")
 	}
@@ -27,7 +27,7 @@ func (l *Launchd) Install(t *task.Task, cronExpr string) error {
 	}
 
 	plistPath := l.plistPath(t)
-	content, err := l.generatePlist(t, cronExpr)
+	content, err := l.generatePlist(t, spec)
 	if err != nil {
 		return err
 	}
@@ -53,7 +53,6 @@ func (l *Launchd) IsLive(t *task.Task) bool {
 	if runtime.GOOS != "darwin" {
 		return false
 	}
-	// quick check: plist exists and launchctl list contains the label
 	if !fileExists(l.plistPath(t)) {
 		return false
 	}
@@ -71,47 +70,13 @@ func (l *Launchd) plistPath(t *task.Task) string {
 	return filepath.Join(dir, t.LaunchdLabel+".plist")
 }
 
-func (l *Launchd) generatePlist(t *task.Task, cronExpr string) (string, error) {
+func (l *Launchd) generatePlist(t *task.Task, spec *schedule.Spec) (string, error) {
 	self, err := SelfBinary()
 	if err != nil {
 		return "", err
 	}
 
-	// We always run through our own binary so last_run is recorded.
 	progArgs := []string{self, "_run", t.Name}
-
-	var interval *int
-	var calendar map[string]int
-
-	// Very small subset of cron → launchd mapping (same as Python prototype)
-	switch {
-	case strings.HasPrefix(cronExpr, "*/") && strings.HasSuffix(cronExpr, " * * * *"):
-		nStr := strings.TrimPrefix(strings.Fields(cronExpr)[0], "*/")
-		if n, err := strconv.Atoi(nStr); err == nil {
-			secs := n * 60
-			interval = &secs
-		}
-	case cronExpr == "0 * * * *" || cronExpr == "@hourly":
-		secs := 3600
-		interval = &secs
-	case cronExpr == "0 0 * * *" || cronExpr == "@daily":
-		calendar = map[string]int{"Hour": 0, "Minute": 0}
-	default:
-		// fallback: try to parse "M H * * *"
-		parts := strings.Fields(cronExpr)
-		if len(parts) == 5 && parts[2] == "*" && parts[3] == "*" && parts[4] == "*" {
-			mi, err1 := strconv.Atoi(parts[0])
-			h, err2 := strconv.Atoi(parts[1])
-			if err1 == nil && err2 == nil {
-				calendar = map[string]int{"Hour": h, "Minute": mi}
-			}
-		}
-		if calendar == nil && interval == nil {
-			// last resort
-			calendar = map[string]int{"Hour": 0, "Minute": 0}
-		}
-	}
-
 	logFile := config.LogPath(t.Name)
 
 	var b strings.Builder
@@ -129,30 +94,66 @@ func (l *Launchd) generatePlist(t *task.Task, cronExpr string) (string, error) {
 		b.WriteString(fmt.Sprintf("  <key>WorkingDirectory</key><string>%s</string>\n", xmlEscape(t.WorkingDir)))
 	}
 
-	if interval != nil {
-		b.WriteString(fmt.Sprintf("  <key>StartInterval</key><integer>%d</integer>\n", *interval))
-	}
-	if calendar != nil {
-		b.WriteString("  <key>StartCalendarInterval</key>\n  <dict>\n")
-		for k, v := range calendar {
-			b.WriteString(fmt.Sprintf("    <key>%s</key><integer>%d</integer>\n", k, v))
+	// Prefer structured Spec mapping over ad-hoc cron parsing.
+	switch {
+	case spec.IntervalSeconds > 0:
+		b.WriteString(fmt.Sprintf("  <key>StartInterval</key><integer>%d</integer>\n", spec.IntervalSeconds))
+	case len(spec.Calendars) == 1:
+		writeCalendarDict(&b, spec.Calendars[0], "  ")
+	case len(spec.Calendars) > 1:
+		// Multiple StartCalendarInterval entries (e.g. weekdays).
+		b.WriteString("  <key>StartCalendarInterval</key>\n  <array>\n")
+		for _, cal := range spec.Calendars {
+			writeCalendarDict(&b, cal, "    ")
 		}
+		b.WriteString("  </array>\n")
+	case spec.Cron == "@reboot":
+		// Run once when the agent is loaded (login / boot for user agents).
+		b.WriteString("  <key>RunAtLoad</key><true/>\n")
+	default:
+		// Opaque cron we couldn't map — fall back to daily midnight so the
+		// plist is still valid; user should prefer crontab for exotic exprs.
+		b.WriteString("  <key>StartCalendarInterval</key>\n  <dict>\n")
+		b.WriteString("    <key>Hour</key><integer>0</integer>\n")
+		b.WriteString("    <key>Minute</key><integer>0</integer>\n")
 		b.WriteString("  </dict>\n")
+	}
+
+	// Always set RunAtLoad false unless @reboot handled above.
+	if spec.Cron != "@reboot" {
+		b.WriteString("  <key>RunAtLoad</key><false/>\n")
 	}
 
 	b.WriteString(fmt.Sprintf("  <key>StandardOutPath</key><string>%s</string>\n", xmlEscape(logFile)))
 	b.WriteString(fmt.Sprintf("  <key>StandardErrorPath</key><string>%s</string>\n", xmlEscape(logFile)))
-	b.WriteString("  <key>RunAtLoad</key><false/>\n")
 	b.WriteString("</dict>\n</plist>\n")
 	return b.String(), nil
 }
 
+func writeCalendarDict(b *strings.Builder, cal schedule.Calendar, indent string) {
+	b.WriteString(indent + "<dict>\n")
+	if cal.Minute != nil {
+		b.WriteString(fmt.Sprintf("%s  <key>Minute</key><integer>%d</integer>\n", indent, *cal.Minute))
+	}
+	if cal.Hour != nil {
+		b.WriteString(fmt.Sprintf("%s  <key>Hour</key><integer>%d</integer>\n", indent, *cal.Hour))
+	}
+	if cal.Day != nil {
+		b.WriteString(fmt.Sprintf("%s  <key>Day</key><integer>%d</integer>\n", indent, *cal.Day))
+	}
+	if cal.Weekday != nil {
+		b.WriteString(fmt.Sprintf("%s  <key>Weekday</key><integer>%d</integer>\n", indent, *cal.Weekday))
+	}
+	if cal.Month != nil {
+		b.WriteString(fmt.Sprintf("%s  <key>Month</key><integer>%d</integer>\n", indent, *cal.Month))
+	}
+	b.WriteString(indent + "</dict>\n")
+}
+
 func (l *Launchd) load(plistPath string) error {
 	uid := os.Getuid()
-	// Prefer modern bootstrap
 	err := run("launchctl", "bootstrap", fmt.Sprintf("gui/%d", uid), plistPath)
 	if err != nil {
-		// fallback for older macOS
 		return run("launchctl", "load", plistPath)
 	}
 	return nil
@@ -175,5 +176,4 @@ func xmlEscape(s string) string {
 	return s
 }
 
-// Keep the compiler happy on non-darwin when we reference exec
 var _ = exec.Command
