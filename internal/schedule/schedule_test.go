@@ -2,6 +2,7 @@ package schedule
 
 import (
 	"testing"
+	"time"
 )
 
 func TestParseEveryInterval(t *testing.T) {
@@ -91,5 +92,32 @@ func TestParseSpecials(t *testing.T) {
 	}
 	if spec.IntervalSeconds != 3600 {
 		t.Errorf("interval %d", spec.IntervalSeconds)
+	}
+}
+
+func TestNextRunDaily(t *testing.T) {
+	spec, err := Parse("every day at 14:30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := time.Date(2026, 9, 16, 10, 0, 0, 0, time.Local)
+	n := NextRun(spec, from)
+	if n == nil {
+		t.Fatal("expected next run")
+	}
+	if n.Hour() != 14 || n.Minute() != 30 {
+		t.Fatalf("got %v", n)
+	}
+}
+
+func TestNextRunInterval(t *testing.T) {
+	spec, err := Parse("every 15m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := time.Date(2026, 9, 16, 10, 7, 0, 0, time.Local)
+	n := NextRun(spec, from)
+	if n == nil {
+		t.Fatal("expected next run")
 	}
 }

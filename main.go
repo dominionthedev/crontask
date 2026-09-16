@@ -17,7 +17,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const version = "0.2.0"
+const version = "0.2.1"
 
 func main() {
 	root := &cobra.Command{
@@ -32,6 +32,9 @@ Schedules use a flexible "every …" syntax with 24-hour times, for example:
   at 14:30 | @daily | classic 5-field cron`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		CompletionOptions: cobra.CompletionOptions{
+			HiddenDefaultCmd: false,
+		},
 	}
 
 	root.AddCommand(
@@ -44,6 +47,7 @@ Schedules use a flexible "every …" syntax with 24-hour times, for example:
 		cmdRun(),
 		cmdLogs(),
 		cmdDoctor(),
+		cmdEdit(),
 		cmdImport(),
 		cmdExportCron(),
 		cmdVersion(),
@@ -163,20 +167,12 @@ func cmdList() *cobra.Command {
 				live[n] = true
 			}
 
-			fmt.Printf("%-20s %-8s %-10s %-28s %s\n", "NAME", "ENABLED", "BACKEND", "SCHEDULE", "COMMAND")
-			fmt.Println(strings.Repeat("-", 96))
+			now := time.Now()
+			fmt.Printf("%-18s %-7s %-8s %-22s %-12s %-12s %s\n",
+				"NAME", "ON", "BACKEND", "SCHEDULE", "LAST", "NEXT", "COMMAND")
+			fmt.Println(strings.Repeat("-", 110))
 
-			names := make([]string, 0, len(tasks))
-			for n := range tasks {
-				names = append(names, n)
-			}
-			for i := 0; i < len(names); i++ {
-				for j := i + 1; j < len(names); j++ {
-					if names[j] < names[i] {
-						names[i], names[j] = names[j], names[i]
-					}
-				}
-			}
+			names := sortedNames(tasks)
 
 			for _, name := range names {
 				t := tasks[name]
@@ -185,18 +181,56 @@ func cmdList() *cobra.Command {
 					en = "yes"
 				}
 				cmdShort := t.Command
-				if len(cmdShort) > 40 {
-					cmdShort = cmdShort[:40] + "…"
+				if len(cmdShort) > 28 {
+					cmdShort = cmdShort[:28] + "…"
 				}
 				liveMark := ""
 				if t.Backend == "crontab" && live[name] {
-					liveMark = " [live]"
+					liveMark = "*"
 				}
-				fmt.Printf("%-20s %-8s %-10s %-28s %s%s\n", name, en, t.Backend, t.Schedule, cmdShort, liveMark)
+
+				last := "-"
+				if t.LastRun != nil {
+					last = t.LastRun.Local().Format("01-02 15:04")
+					if t.LastStatus != nil && *t.LastStatus != 0 {
+						last += "!"
+					}
+				}
+
+				next := "-"
+				if t.Enabled {
+					if spec, err := schedule.Parse(t.Schedule); err == nil {
+						if n := schedule.NextRun(spec, now); n != nil {
+							next = schedule.FormatRelative(*n, now)
+						}
+					}
+				}
+
+				sched := t.Schedule
+				if len(sched) > 22 {
+					sched = sched[:20] + "…"
+				}
+				fmt.Printf("%-18s %-7s %-8s %-22s %-12s %-12s %s\n",
+					name, en+liveMark, t.Backend, sched, last, next, cmdShort)
 			}
 			return nil
 		},
 	}
+}
+
+func sortedNames(tasks map[string]*task.Task) []string {
+	names := make([]string, 0, len(tasks))
+	for n := range tasks {
+		names = append(names, n)
+	}
+	for i := 0; i < len(names); i++ {
+		for j := i + 1; j < len(names); j++ {
+			if names[j] < names[i] {
+				names[i], names[j] = names[j], names[i]
+			}
+		}
+	}
+	return names
 }
 
 func cmdShow() *cobra.Command {
@@ -212,7 +246,15 @@ func cmdShow() *cobra.Command {
 			}
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			return enc.Encode(t)
+			if err := enc.Encode(t); err != nil {
+				return err
+			}
+			if spec, err := schedule.Parse(t.Schedule); err == nil {
+				if n := schedule.NextRun(spec, time.Now()); n != nil {
+					fmt.Printf("next_run: %s (%s)\n", n.Local().Format(time.RFC3339), schedule.FormatRelative(*n, time.Now()))
+				}
+			}
+			return nil
 		},
 	}
 }
@@ -436,6 +478,119 @@ func parseEnvFlags(pairs []string) (map[string]string, error) {
 		env[k] = v
 	}
 	return env, nil
+}
+
+
+func cmdEdit() *cobra.Command {
+	var (
+		command     string
+		sched       string
+		backendName string
+		desc        string
+		cwd         string
+		envVars     []string
+		hookOK      string
+		hookFail    string
+		clearEnv    bool
+	)
+	c := &cobra.Command{
+		Use:   "edit <name>",
+		Short: "Edit an existing task",
+		Long:  "Change fields on a task. If the task is enabled, the scheduler entry is reinstalled.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			store := task.NewStore()
+			t, err := store.Get(name)
+			if err != nil {
+				return err
+			}
+
+			changed := false
+			if cmd.Flags().Changed("cmd") {
+				t.Command = command
+				changed = true
+			}
+			if cmd.Flags().Changed("schedule") {
+				if _, err := schedule.Parse(sched); err != nil {
+					return err
+				}
+				t.Schedule = sched
+				changed = true
+			}
+			if cmd.Flags().Changed("backend") {
+				t.Backend = backendName
+				changed = true
+			}
+			if cmd.Flags().Changed("description") {
+				t.Description = desc
+				changed = true
+			}
+			if cmd.Flags().Changed("cwd") {
+				t.WorkingDir = cwd
+				changed = true
+			}
+			if clearEnv {
+				t.Env = map[string]string{}
+				changed = true
+			}
+			if cmd.Flags().Changed("env") {
+				env, err := parseEnvFlags(envVars)
+				if err != nil {
+					return err
+				}
+				if t.Env == nil {
+					t.Env = map[string]string{}
+				}
+				for k, v := range env {
+					t.Env[k] = v
+				}
+				changed = true
+			}
+			if cmd.Flags().Changed("webhook-success") {
+				t.WebhookSuccess = hookOK
+				changed = true
+			}
+			if cmd.Flags().Changed("webhook-failure") {
+				t.WebhookFailure = hookFail
+				changed = true
+			}
+			if !changed {
+				return fmt.Errorf("nothing to change (pass --cmd, --schedule, --env, …)")
+			}
+
+			t.UpdatedAt = time.Now().UTC()
+			b := backend.Detect(t.Backend)
+			t.Backend = b.Name()
+
+			if t.Enabled {
+				spec, err := schedule.Parse(t.Schedule)
+				if err != nil {
+					return err
+				}
+				_ = b.Uninstall(t)
+				if err := b.Install(t, spec); err != nil {
+					return err
+				}
+			}
+
+			if err := store.Put(t); err != nil {
+				return err
+			}
+			fmt.Printf("updated %q\n", name)
+			return nil
+		},
+	}
+	c.Flags().StringVar(&command, "cmd", "", "new command")
+	c.Flags().StringVarP(&sched, "schedule", "s", "", "new schedule")
+	c.Flags().StringVar(&backendName, "backend", "", "auto | crontab | launchd")
+	c.Flags().StringVarP(&desc, "description", "d", "", "description")
+	c.Flags().StringVar(&cwd, "cwd", "", "working directory")
+	c.Flags().StringArrayVar(&envVars, "env", nil, "set/merge KEY=VALUE (repeatable)")
+	c.Flags().BoolVar(&clearEnv, "clear-env", false, "remove all environment variables")
+	c.Flags().StringVar(&hookOK, "webhook-success", "", "success webhook URL")
+	c.Flags().StringVar(&hookFail, "webhook-failure", "", "failure webhook URL")
+	return c
 }
 
 func cmdImport() *cobra.Command {
